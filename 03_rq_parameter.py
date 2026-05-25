@@ -10,181 +10,10 @@ import binascii # Required for CRC calculation
 import queue  # For inter-thread communication
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
-import ctypes
-from ctypes import wintypes
 
-# ============================================================================
-# ZLG USBCAN2 支持 - 自定义 CAN 总线类，调用 zlgcan.dll
-# ============================================================================
-
-# ZLG 定义常量
-VCI_USBCAN2 = 4          # 设备类型
-VCI_USBCAN2_INDEX = 0    # 设备索引，一般从0开始
-CHANNEL_0 = 0            # CAN通道0
-CHANNEL_1 = 1
-
-STATUS_OK = 1
-
-# 帧类型掩码
-CAN_ID_STANDARD = 0x00000000
-CAN_ID_EXTENDED = 0x80000000
-
-class ZLGCAN_STRUCT(ctypes.Structure):
-    """ZLG CAN 帧结构体（与 CAN_OBJ 对应）"""
-    _fields_ = [
-        ("ID", ctypes.c_uint),           # 帧ID
-        ("TimeStamp", ctypes.c_uint),    # 时间戳
-        ("TimeFlag", ctypes.c_byte),     # 时间标志
-        ("SendType", ctypes.c_byte),     # 发送类型
-        ("RemoteFlag", ctypes.c_byte),   # 远程帧标志
-        ("ExternFlag", ctypes.c_byte),   # 扩展帧标志
-        ("DataLen", ctypes.c_byte),      # 数据长度 DLC
-        ("Data", ctypes.c_byte * 8),     # 数据
-        ("Reserved", ctypes.c_byte * 3), # 保留
-    ]
-
-class ZlgCanBus:
-    """
-    自定义 CAN 总线类，封装 ZLG USBCAN2 动态库调用，
-    实现与 python-can.Bus 相似的接口，以便 BackendAPI 使用。
-    """
-    def __init__(self, channel=CHANNEL_0, bitrate=250000):
-        self.channel = channel
-        self.bitrate = bitrate
-        self.dll = None
-
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        dll_dirs = [script_dir, os.path.join(script_dir, "kerneldlls")]
-        for d in dll_dirs:
-            if os.path.isdir(d):
-                try:
-                    os.add_dll_directory(d)
-                except (AttributeError, Exception):
-                    pass
-
-        dll_path = os.path.join(script_dir, "zlgcan.dll")
-        if not os.path.isfile(dll_path):
-            dll_path = "zlgcan.dll"
-
-        try:
-            self.dll = ctypes.WinDLL(dll_path)
-        except OSError as e:
-            kernel_dlls_path = os.path.join(script_dir, "kerneldlls")
-            if os.path.isdir(kernel_dlls_path):
-                old_path = os.environ.get("PATH", "")
-                os.environ["PATH"] = kernel_dlls_path + os.pathsep + old_path
-                try:
-                    self.dll = ctypes.WinDLL(dll_path)
-                except OSError as e2:
-                    # 检测位数不匹配
-                    if e2.winerror == 193:  # ERROR_BAD_EXE_FORMAT
-                        python_bits = ctypes.sizeof(ctypes.c_void_p) * 8
-                        raise RuntimeError(
-                            f"DLL 位数不匹配：当前 Python 是 {python_bits} 位，但 '{dll_path}' 可能为 {64 if python_bits==32 else 32} 位。\n"
-                            f"请使用 {python_bits} 位版本的 zlgcan.dll（可从 ZLG 开发包中获取）。"
-                        ) from e2
-                    else:
-                        raise RuntimeError(f"加载 zlgcan.dll 失败（已调整 PATH）：{e2}")
-            else:
-                raise RuntimeError(f"加载 zlgcan.dll 失败：{e}")
-
-        # 定义函数原型 
-        self.dll.OpenDevice.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-        self.dll.OpenDevice.restype = ctypes.c_uint
-
-        self.dll.CloseDevice.argtypes = [ctypes.c_uint, ctypes.c_uint]
-        self.dll.CloseDevice.restype = ctypes.c_uint
-
-        self.dll.InitCAN.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-        self.dll.InitCAN.restype = ctypes.c_uint
-
-        self.dll.ReadCanMsg.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ZLGCAN_STRUCT), ctypes.c_uint, ctypes.c_uint]
-        self.dll.ReadCanMsg.restype = ctypes.c_uint
-
-        self.dll.WriteCanMsg.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ZLGCAN_STRUCT), ctypes.c_uint]
-        self.dll.WriteCanMsg.restype = ctypes.c_uint
-
-        self.dll.StartCAN = self.dll.StartCAN
-        self.dll.StartCAN.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-        self.dll.StartCAN.restype = ctypes.c_uint
-
-        self.dll.ResetCAN = self.dll.ResetCAN
-        self.dll.ResetCAN.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-        self.dll.ResetCAN.restype = ctypes.c_uint
-
-        # 打开设备
-        if self.dll.OpenDevice(VCI_USBCAN2, VCI_USBCAN2_INDEX, 0) != STATUS_OK:
-            raise RuntimeError("OpenDevice failed")
-
-        # 初始化 CAN 通道
-        # 波特率换算：250k -> 0x06000C, 500k -> 0x060008, 1M -> 0x060004
-        baud_map = {
-            125000: 0x06000E,
-            250000: 0x06000C,
-            500000: 0x060008,
-            1000000: 0x060004,
-        }
-        baud_code = baud_map.get(bitrate, 0x06000C)
-        if self.dll.InitCAN(VCI_USBCAN2, VCI_USBCAN2_INDEX, self.channel, baud_code) != STATUS_OK:
-            self.dll.CloseDevice(VCI_USBCAN2, VCI_USBCAN2_INDEX)
-            raise RuntimeError("InitCAN failed")
-
-        # 启动 CAN 通道
-        if self.dll.StartCAN(VCI_USBCAN2, VCI_USBCAN2_INDEX, self.channel) != STATUS_OK:
-            self.dll.CloseDevice(VCI_USBCAN2, VCI_USBCAN2_INDEX)
-            raise RuntimeError("StartCAN failed")
-
-    def send(self, msg):
-        """
-        发送 CAN 消息
-        :param msg: python-can.Message 对象
-        """
-        zlg_msg = ZLGCAN_STRUCT()
-        zlg_msg.ID = msg.arbitration_id
-        zlg_msg.ExternFlag = 1 if msg.is_extended_id else 0
-        zlg_msg.RemoteFlag = 0  # 数据帧
-        zlg_msg.SendType = 0    # 正常发送
-        zlg_msg.DataLen = msg.dlc if msg.dlc else len(msg.data)
-
-        data_bytes = msg.data[:8]
-        for i, b in enumerate(data_bytes):
-            zlg_msg.Data[i] = b
-        for i in range(len(data_bytes), 8):
-            zlg_msg.Data[i] = 0
-
-        if self.dll.WriteCanMsg(VCI_USBCAN2, VCI_USBCAN2_INDEX, self.channel, ctypes.byref(zlg_msg), 1) != STATUS_OK:
-            raise can.CanError("WriteCanMsg failed")
-
-    def recv(self, timeout=0.01):
-        """
-        接收 CAN 消息（非阻塞）
-        :param timeout: 超时时间（秒），实际用于内部休眠，因为 ReadCanMsg 本身是立即返回的
-        :return: python-can.Message 对象或 None
-        """
-        start = time.time()
-        while True:
-            buf = (ZLGCAN_STRUCT * 10)()
-            count = self.dll.ReadCanMsg(VCI_USBCAN2, VCI_USBCAN2_INDEX, self.channel, buf, 10, 0)
-            if count > 0:
-                zlg_msg = buf[0]
-                msg = can.Message(
-                    arbitration_id=zlg_msg.ID,
-                    data=bytes(zlg_msg.Data[:zlg_msg.DataLen]),
-                    dlc=zlg_msg.DataLen,
-                    is_extended_id=(zlg_msg.ExternFlag != 0)
-                )
-                return msg
-            if timeout is not None and (time.time() - start) >= timeout:
-                return None
-            time.sleep(0.001)
-
-    def shutdown(self):
-        """关闭 CAN 设备"""
-        try:
-            self.dll.ResetCAN(VCI_USBCAN2, VCI_USBCAN2_INDEX, self.channel)
-            self.dll.CloseDevice(VCI_USBCAN2, VCI_USBCAN2_INDEX)
-        except:
-            pass
+'''
+pyinstaller --onefile --windowed --hidden-import=can.interfaces.socketcan --hidden-import=can.interfaces.pcan --hidden-import=can.interfaces.vector --hidden-import=can.interfaces.ixxat --hidden-import=can.interfaces.neovi --hidden-import=can.interfaces.iscan --hidden-import=can.interfaces.kvaser --hidden-import=can.interfaces.nican --hidden-import=can.interfaces.systec --hidden-import=can.interfaces.seeedstudio d:/Program_source/mcu/work_space/02_Automotive_Industry/01_Vehicle_Control_Unit/01_MVCU/tools/01_ota/03_rq_parameter.py
+'''
 
 # ============================================================================
 # 协议配置类 - 集中管理所有CAN协议常量
@@ -295,7 +124,7 @@ class BackendAPI:
         初始化BackendAPI
 
         Args:
-            can_bus: python-can Bus对象或 ZlgCanBus 对象
+            can_bus: python-can Bus对象
             log_callback: 日志回调函数，用于记录消息到GUI
         """
         self.can_bus = can_bus
@@ -1423,7 +1252,7 @@ class OTAUpdaterGUI:
     # --- GUI 辅助方法 ---
 
     def populate_interfaces(self):
-        """Populates the CAN interface combobox with available interfaces, including ZLG."""
+        """Populates the CAN interface combobox with available interfaces."""
         try:
             configs = can.detect_available_configs(interfaces=None)
             available_channels = []
@@ -1433,12 +1262,7 @@ class OTAUpdaterGUI:
                 bitrate = config.get('bitrate', 'N/A')
                 description = f"{interface_name} - {channel} (Bitrate: {bitrate})"
                 available_channels.append(description)
-
-            # 添加 ZLG USBCAN2 选项
-            if platform.system() == "Windows":
-                available_channels.append("zlgcan - USBCAN2 (Channel 0)")
-                available_channels.append("zlgcan - USBCAN2 (Channel 1)")
-
+            
             if available_channels:
                 self.combo_iface['values'] = available_channels
                 self.selected_interface.set(available_channels[0])
@@ -1449,19 +1273,16 @@ class OTAUpdaterGUI:
                     fallback_channels.extend(["socketcan - can0", "socketcan - can1", "virtual - test"])
                 elif system == "Windows":
                     fallback_channels.extend(["pcan - PCAN_USBBUS1", "pcan - PCAN_USBBUS2", "virtual - test"])
-                    fallback_channels.append("zlgcan - USBCAN2 (Channel 0)")
                 else:
                     fallback_channels.append("virtual - test")
-
+                
                 self.combo_iface['values'] = fallback_channels
                 if fallback_channels:
                     self.selected_interface.set(fallback_channels[0])
-
+                
                 self.log_status("Could not auto-detect CAN interfaces. Showing common/default options. Please select the correct one for your hardware.")
         except Exception as e:
             fallback_channels = ["virtual - test"]
-            if platform.system() == "Windows":
-                fallback_channels.append("zlgcan - USBCAN2 (Channel 0)")
             self.combo_iface['values'] = fallback_channels
             self.selected_interface.set(fallback_channels[0])
             self.log_status(f"Failed to detect CAN interfaces: {e}. Using default option: {fallback_channels[0]}")
@@ -1648,45 +1469,32 @@ class OTAUpdaterGUI:
         """Initializes the CAN bus connection based on user selection."""
         try:
             selected_str = self.selected_interface.get()
-            # 解析接口类型和通道
-            if selected_str.startswith("zlgcan"):
-                # 使用 ZLG 自定义总线
-                # 格式: "zlgcan - USBCAN2 (Channel X)"
-                channel = 0  # 默认通道0
-                if "Channel 1" in selected_str:
-                    channel = 1
-                bitrate = int(self.selected_bitrate.get())
-                self.can_bus = ZlgCanBus(channel=channel, bitrate=bitrate)
-                self.log_status(f"ZLG CAN bus initialized: USBCAN2 channel {channel} at {bitrate} baud.")
-                return True
+            if " - " in selected_str:
+                parts = selected_str.split(" - ")
+                interface_type = parts[0].strip()
+                channel_part = parts[1].split(" ")[0]
             else:
-                # 原有 python-can 逻辑
-                if " - " in selected_str:
-                    parts = selected_str.split(" - ")
-                    interface_type = parts[0].strip()
-                    channel_part = parts[1].split(" ")[0]
-                else:
-                    interface_type = selected_str
-                    channel_part = "auto_detect_or_default"
+                interface_type = selected_str
+                channel_part = "auto_detect_or_default"
 
-                bitrate = int(self.selected_bitrate.get())
+            bitrate = int(self.selected_bitrate.get())
 
-                if interface_type.lower() == 'socketcan':
-                    channel = channel_part
-                    bustype = 'socketcan'
-                elif interface_type.lower() == 'pcan':
-                    channel = channel_part
-                    bustype = 'pcan'
-                elif interface_type.lower() == 'virtual':
-                    channel = channel_part if channel_part != 'N/A' else 'test'
-                    bustype = 'virtual'
-                else:
-                    channel = channel_part
-                    bustype = interface_type.lower()
+            if interface_type.lower() == 'socketcan':
+                channel = channel_part
+                bustype = 'socketcan'
+            elif interface_type.lower() == 'pcan':
+                channel = channel_part
+                bustype = 'pcan'
+            elif interface_type.lower() == 'virtual':
+                 channel = channel_part if channel_part != 'N/A' else 'test'
+                 bustype = 'virtual'
+            else:
+                 channel = channel_part
+                 bustype = interface_type.lower()
 
-                self.can_bus = can.interface.Bus(channel=channel, bustype=bustype, bitrate=bitrate)
-                self.log_status(f"CAN bus initialized: {bustype} on {channel} at {bitrate} baud.")
-                return True
+            self.can_bus = can.interface.Bus(channel=channel, bustype=bustype, bitrate=bitrate)
+            self.log_status(f"CAN bus initialized: {bustype} on {channel} at {bitrate} baud.")
+            return True
         except Exception as e:
             error_msg = f"Failed to initialize CAN bus with {self.selected_interface.get()} at {self.selected_bitrate.get()} baud: {e}"
             self.log_status(error_msg)
@@ -2085,6 +1893,47 @@ class OTAUpdaterGUI:
                 self.param_tree.item(item, values=new_values)
                 break
 
+'''
+里程数读取：
+设备广播 <0x024>[8]{xx xx xx xx xx xx xx xx}
+xx xx xx xx xx xx xx xx<8byte> 表示数据，但是我们只需要解析 bit24开始，长度为24bit 的数据，小端，得到的数据为里程数
+
+配置报文：
+主机下发标准帧 <0x700>[8]{aa bb bb cc dd dd dd dd}
+aa<1byte> 表示配置请求，每次发送bit0都进行取反，bit1为0表示写入，bit1为1表示读取，bit2-bit7保持为0
+bb bb<2byte> 表示地址，大端
+cc<1byte> 预留位
+dd dd dd dd<4byte> 表示数据，大端
+
+设备回应标准帧 <0x710>[8]{aa bb bb cc dd dd dd dd}
+aa<1byte> 表示配置回应，每次发送bit0都与主机发送相同，如果取反表示配置出错，bit1为0表示写入，bit1为1表示读取，bit2-bit7保持为0
+bb bb<2byte> 表示地址，大端
+cc<1byte> 预留位
+dd dd dd dd<4byte> 表示数据，大端
+
+注: 
+参数存在缩放系数，会在末尾以"<>"标志缩放比例，例如: 电机齿轮减速比<0.001>，用户写入 12.4，实际为 12.400，在报文中为 12400
+写入的数据超出VCU的范围，在回复时，VCU回复本地数据，上位机需要在终端打印错误
+ODO总里程数较为特殊，有专门的ID广播到总线中，其他值仅仅支持配置，上位机仅仅有配置框与写入按钮
+
+具体地址如下:
+0x00: 无效ID
+0x01: ODO总里程数(km);
+0x02: 轮胎滚动半径(mm);
+0x03: 电机齿轮减速比<0.001>;
+0x04: 整车最大续航里程数(km);
+0x05: VCU定时唤醒为蓄电池智能补电设置时间(min);
+0x06: VCU下电休眠等待时间(s);
+0x07: 车辆倾斜切断动力的角度(Roll Angle, °)
+0x08: 车辆扶正恢复动力的角度(Roll Angle, °)
+0x09: 开启水泵的电机温度设置值(℃)
+0x0A: 关闭水泵的电机温度设置值(℃)
+0x0B: 开启水泵的电控温度设置值(℃)
+0x0C: 关闭水泵的电控温度设置值(℃)
+0x0D: 开启水泵的OBC温度设置值(℃)
+0x0E: 关闭水泵的OBC温度设置值(℃)
+0x0F: 请求水泵强制打开/关闭
+'''
 
 if __name__ == "__main__":
     root = tk.Tk()
@@ -2096,8 +1945,22 @@ if __name__ == "__main__":
     app.log_status("=" * 80)
     app.log_status("INFO: Warnings about missing CAN backend drivers during import are NORMAL.")
     app.log_status("      The tool works as long as your specific CAN driver is available.")
-    app.log_status("      Common drivers: PCAN (Windows), SocketCAN (Linux), Virtual (test), ZLG USBCAN2 (Windows)")
+    app.log_status("      Common drivers: PCAN (Windows), SocketCAN (Linux), Virtual (test)")
     app.log_status("=" * 80)
+    '''
+    def _crc32_calc(self, poly, data, len):
+        # 多项式：0x04C11DB7 初始值：FFFFFFFF 异或值：00000000
+        crc = 0xffffffff
+        for i in range(len):
+            crc ^= data[i] << 24
+            for j in range(8):
+                if crc & 0x80000000:
+                    crc = (crc << 1) ^ poly
+                else:
+                    crc <<= 1
+                crc &= 0xFFFFFFFF
+        return crc
+    '''
     app.log_status("CRC32 算法参考, C语言同理, 如果需要计算多包数据，需要将上次的CRC32值作为参数传入:")
     app.log_status("def _crc32_calc(self, poly, data, len):")
     app.log_status("    # 多项式：0x04C11DB7 初始值：FFFFFFFF 异或值：00000000")
@@ -2112,6 +1975,6 @@ if __name__ == "__main__":
     app.log_status("            crc &= 0xFFFFFFFF")
     app.log_status("    return crc")
     app.log_status("=" * 80)
-    app.log_status("该版本已集成 ZLG USBCAN2 支持，并修复 DLL 加载问题。")
+    app.log_status("该版本OTA功能不正常")
 
     root.mainloop()
